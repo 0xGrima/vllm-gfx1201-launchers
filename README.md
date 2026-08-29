@@ -28,6 +28,73 @@ boots of the identical config — this checkpoint's GDN-hybrid architecture show
 KV/scheduling noise of a couple percent; treat any single number as a point in that band, not a
 fixed constant.
 
+## Quickstart: from scratch
+
+Expect this whole thing to take **30-60 minutes**, mostly download time
+(~60 GB across both models) plus ~15 minutes for the FP8-MTP conversion step.
+
+```bash
+set -euo pipefail
+
+# 0. checkpoint root -- one tree, both models as siblings under it
+MODELS=/path/to/models
+mkdir -p "$MODELS"
+
+# 1. clone + build the image
+git clone https://github.com/malicz/vllm-gfx1201-launchers.git vllm-gfx1201-launchers
+cd vllm-gfx1201-launchers
+docker build -t local-radiance-mxfp4:0.9.3 -f Dockerfile .
+
+# 2. Qwen3.8-27B MXFP4 base checkpoint
+hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --local-dir "$MODELS/Qwen3.8-27B-Quark-AWQ-MXFP4"
+
+# 3. fp8_mtp.py -- MTP head to FP8 (standalone, host-side, needs torch: pip install torch
+#    --index-url https://download.pytorch.org/whl/cpu). ~15 min, ~19 GB.
+curl -fsSL "https://codeberg.org/ggz14/radiance-vllm-mxfp4/raw/commit/dba9defefb2de7f914fe9cb45ffdf49989c923d6/fp8_mtp.py" \
+  -o /tmp/fp8_mtp.py
+python3 /tmp/fp8_mtp.py "$MODELS/Qwen3.8-27B-Quark-AWQ-MXFP4" "$MODELS/Qwen3.8-27B-MXFP4-mtpfp8"
+# rel-err rows should read ~0.02-0.03; ~0.116 means that layer wasn't converted
+
+# 4. per-token variant (what the launcher serves) -- symlink farm + config.json rewrite
+SRC="$MODELS/Qwen3.8-27B-MXFP4-mtpfp8"
+DST="$MODELS/Qwen3.8-27B-MXFP4-mtpfp8-pertoken"
+mkdir -p "$DST" && cd "$DST"
+for f in model.safetensors tokenizer.json tokenizer_config.json merges.txt \
+         generation_config.json chat_template.jinja preprocessor_config.json processor_config.json; do
+  [ -e "$SRC/$f" ] && ln -sf "../$(basename "$SRC")/$f" .
+done
+python3 - "$SRC/config.json" "$DST/config.json" <<'EOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+n = 0
+for name, spec in cfg["quantization_config"]["layer_quant_config"].items():
+    it = spec.get("input_tensors")
+    if not name.startswith("mtp") or not it:
+        continue
+    it["qscheme"]      = "per_channel"
+    it["ch_axis"]      = 0
+    it["observer_cls"] = "PerChannelMinMaxObserver"
+    n += 1
+json.dump(cfg, open(sys.argv[2], "w"), indent=2)
+print(f"rewrote {n} mtp input_tensors to per_channel")  # expect 8
+EOF
+cd - >/dev/null
+
+# 5. DFlash2 drafter
+hf download syvai/Qwen3.8-27B-DFlash2-W4A16 --local-dir "$MODELS/Qwen3.8-27B-DFlash2-W4A16"
+
+# 6. Ornith-1.5-35B-A3B
+hf download MIRALABS/Ornith-1.5-35B-A3B-W4A16-SYM --local-dir "$MODELS/ornith-1.5-35b-a3b-w4a16-sym"
+
+# 7. run either model
+chmod +x startup-qwen3.8-27b-vllm.sh startup-ornith-1.5-35b-vllm.sh
+MODELS_DIR="$MODELS" ./startup-qwen3.8-27b-vllm.sh
+# or:
+MODELS_DIR="$MODELS" ./startup-ornith-1.5-35b-vllm.sh
+
+docker logs -f r9700-qwen3.8-mxfp4   # boot log; or r9700-ornith-1.5
+```
+
 ## The additions on top of the two upstreams
 
 ### 1. ggz14's MXFP4 runtime delta (fetched, not shipped here)
@@ -74,9 +141,7 @@ this patch the drafter cannot be loaded, period.
 
 ## Model downloads & checkpoint prep
 
-**Requires the image built in "Building the image" below** — the FP8-MTP conversion step runs
-inside it (`docker run --entrypoint python ... local-radiance-mxfp4:0.9.3 /src/fp8_mtp.py ...`).
-Build the image first if starting from scratch.
+Steps to download the models and do an mtp conversion.
 
 ```bash
 MODELS=/path/to/models   # wherever you point MODELS_DIR at
@@ -84,11 +149,9 @@ MODELS=/path/to/models   # wherever you point MODELS_DIR at
 # --- Qwen3.8-27B-MXFP4 target ---
 hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --local-dir $MODELS/Qwen3.8-27B-Quark-AWQ-MXFP4
 
-git clone https://codeberg.org/ggz14/radiance-vllm-mxfp4 /tmp/mxfp4-src
-git -C /tmp/mxfp4-src checkout dba9def
-docker run --rm --entrypoint python -v $MODELS:/models -v /tmp/mxfp4-src:/src \
-  local-radiance-mxfp4:0.9.3 \
-  /src/fp8_mtp.py /models/Qwen3.8-27B-Quark-AWQ-MXFP4 /models/Qwen3.8-27B-MXFP4-mtpfp8
+curl -fsSL "https://codeberg.org/ggz14/radiance-vllm-mxfp4/raw/commit/dba9defefb2de7f914fe9cb45ffdf49989c923d6/fp8_mtp.py" \
+  -o /tmp/fp8_mtp.py
+python3 /tmp/fp8_mtp.py $MODELS/Qwen3.8-27B-Quark-AWQ-MXFP4 $MODELS/Qwen3.8-27B-MXFP4-mtpfp8
 # then generate a per-token variant if desired (config-only, ~64KB of symlinks + a rewritten
 # config.json moving the MTP layers' input quantization from per-tensor to per-channel).
 
@@ -107,27 +170,11 @@ hf download MIRALABS/Ornith-1.5-35B-A3B-W4A16-SYM --local-dir $MODELS/ornith-1.5
 
 ## Building the image
 
-The image (`local-radiance-mxfp4:0.9.3`) is built from a Dockerfile that fetches ggz14's runtime
-delta and applies every patch listed above, including this directory's `patch_dflash_w4a16_kv.py`.
-That Dockerfile isn't included in this directory — bring your own, or write one that:
-
-1. Starts `FROM stilldeadcode/vllm-radiance:0.9.3`
-2. `COPY`s in the runtime-delta files from `ggz14/radiance-vllm-mxfp4` @ `dba9def` (see table
-   above) plus this directory's `patches/patch_dflash_w4a16_kv.py` and `patches/_patchlib.py`
-3. Applies each `patch_*.py` in order — **`patch_dflash_w4a16_kv` must run after
-   `patch_dflash_mxfp4_kv`**, it rewrites that patch's own output (see the patch's docstring)
-4. Compiles `radiance_mxfp4_fp8.hip` with `hipcc --offload-arch=gfx1201`
-5. Fetches [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)'s
-   `chat_template.jinja` and bakes it to `/opt/templates/froggeric-qwen.jinja` inside the image
-   — both launcher scripts point `--chat-template` there, and **the container fails to boot
-   without it** (`--chat-template` pointing at a missing file is fatal, not a silent fallback).
-   It's a third-party template (covers Qwen 3.5/3.6/3.8), so it's fetched at build time rather
-   than vendored into this repo, same policy as the MXFP4 runtime delta above. If you'd rather
-   not depend on it, drop `--chat-template ...` from both scripts' `VLLM_ARGS` — vLLM then uses
-   each checkpoint's own shipped `chat_template.jinja` instead (untested by the numbers in this
-   README; the froggeric template is what they were actually measured against).
+The image (`local-radiance-mxfp4:0.9.3`) is built by the `Dockerfile` in this directory — no
+external pieces to assemble yourself.
 
 ```bash
+git clone https://github.com/malicz/vllm-gfx1201-launchers.git vllm-gfx1201-launchers && cd vllm-gfx1201-launchers
 docker build -t local-radiance-mxfp4:0.9.3 -f Dockerfile .
 ```
 
