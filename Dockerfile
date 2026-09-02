@@ -46,7 +46,7 @@ RUN test -f ${SP}/vllm/model_executor/models/qwen3_dflash2.py \
 COPY --from=fetch /templates/froggeric-qwen.jinja /opt/templates/froggeric-qwen.jinja
 
 # Step 2: copy in the runtime-delta files from ggz14's repo (see ../README.md's table for what
-# each one does) plus this repo's own patches/patch_dflash_w4a16_kv.py + patches/_patchlib.py.
+# each one does).
 RUN mkdir -p /opt/patches-mxfp4
 COPY --from=fetch \
     /delta/radiance_mxfp4.py /delta/radiance_gdn.py /delta/radiance_rmsquant.py \
@@ -63,13 +63,11 @@ COPY --from=fetch \
     /delta/radiance_mxfp4_fp8.hip \
     /delta/_patchlib.py \
     /opt/patches-mxfp4/
-COPY patches/patch_dflash_w4a16_kv.py /opt/patches-mxfp4/
 
-# Step 3: apply every patch, in order. patch_dflash_w4a16_kv MUST run after patch_dflash_mxfp4_kv
-# -- it rewrites that patch's own output (see the patch's own docstring, and patches/README.md).
+# Step 3: apply every patch, in order.
 # Step 4: compile the fp8-WMMA W4A8 GEMM kernel with hipcc.
 RUN cd /opt/patches-mxfp4 \
- && for p in patch_quark_mxfp4 patch_dflash_mxfp4_kv patch_dflash_w4a16_kv \
+ && for p in patch_quark_mxfp4 patch_dflash_mxfp4_kv \
              patch_topk_triton_rows patch_ar_maxbytes patch_dflash_calib patch_rmsquant_fusion; do \
       echo "== applying $p =="; python "$p.py"; \
     done \

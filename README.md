@@ -3,10 +3,7 @@
 Standalone vLLM launchers for the AMD Radeon AI PRO R9700 (RDNA4/gfx1201, 32GB) — a showcase of
 how two models are actually run on this card: **Qwen3.8-27B** at native MXFP4 (W4A8) with a
 DFlash2 speculative drafter, and **Ornith-1.5-35B-A3B** (MoE, GDN linear-attention hybrid) at
-compressed-tensors W4A16. 
-
-Both scripts run standalone, without any router/orchestration layer in front — just `docker run`
-and vLLM's own CLI flags.
+plain AutoRound-produced GPTQ W4A16, full native context, vision enabled.
 
 
 ## Overview
@@ -15,18 +12,69 @@ Both models run on the same image — one 32 GB card fits one resident model at 
 published [`stilldeadcode/vllm-radiance:0.9.3`](https://hub.docker.com/r/stilldeadcode/vllm-radiance)
 (vLLM 0.27.1, DFlash2 and `libr4d` 0.5.0 already in-tree), with a runtime patch delta from
 [`ggz14/radiance-vllm-mxfp4`](https://codeberg.org/ggz14/radiance-vllm-mxfp4) @ `dba9def` applied
-on top for the native MXFP4 (W4A8) kernel path — plus the one patch in `patches/` that neither of
-those upstreams ship.
+on top for the native MXFP4 (W4A8) kernel path.
 
-| model | quant | speculative decoding | context | decode | prefill@11.8K |
+| model | quant | speculative decoding | context | decode (weighted combined) | prefill@16K |
 |---|---|---|---|---:|---:|
-| `qwen3.8-27b-mxfp4` | native MXFP4 (W4A8) | DFlash2 n=7 | 163,840 | **78-81 t/s** | 2340-2375 t/s |
-| `ornith-1.5-35b-a3b` | compressed-tensors W4A16 (MoE experts only) | **none** — measured worse | 262,144 | **76.8 t/s** | 7286 t/s @16K |
+| `qwen3.8-27b-mxfp4` | native MXFP4 (W4A8) | DFlash2-FP8 n=7 | 220,000 | **77.7-81.4 t/s**¹ | 2536-2560 t/s¹ |
+| `ornith-1.5-35b-a3b` | AutoRound-produced GPTQ W4A16 (group_size 128) | **none** — this checkpoint's own MTP head isn't good enough to be worth it | 262,144, vision enabled | **~78 t/s** | ~5700-5800 t/s |
 
-Both measured with BetterBench, 300 W, single-stream. Qwen3.8 range reflects four independent
-boots of the identical config — this checkpoint's GDN-hybrid architecture shows real boot-to-boot
-KV/scheduling noise of a couple percent; treat any single number as a point in that band, not a
-fixed constant.
+Both measured with BetterBench, 300 W, single-stream, weighted combined score across BetterBench's
+own category weights (code 0.30 / reasoning 0.20 / prose 0.15 / json 0.15 / file_edit 0.10 /
+summarization 0.10). Qwen3.8's range reflects several independent runs of this config — this
+checkpoint's GDN-hybrid architecture shows real run-to-run KV/scheduling noise of a couple
+percent; treat any single number as a point in that band, not a fixed constant.
+
+**Concurrency** (see the section below the environment-variable table for the full numbers and
+Ornith's own comparison): aggregate throughput scales ~1.8x going from 1 to 2 concurrent
+streams (measured 66.6 t/s -> 121.5 t/s aggregate) and ~2.4x by 3 streams (161.3 t/s), with only
+a modest per-stream decode cost (82.9 -> 80.3 -> 71.4 t/s).
+
+¹ Decode/prefill numbers above were measured at this checkpoint's prior 190,000-context config
+(`GPU_MEM_UTIL=0.97`, `KV_MEM=8232441724`). The context ceiling was since pushed to 220,000
+(`GPU_MEM_UTIL=0.98`, `KV_MEM=9126805504`, see the KV cache section below) — not yet re-run
+through a full BetterBench pass at the new ceiling, though throughput on this architecture has
+consistently measured context-length-independent elsewhere in this repo's own testing.
+
+### Benchmark (Qwen, production config)
+
+Measured with BetterBench against the live production launcher: `Qwen3.8-27B-MXFP4` at its prior
+190,000-token context config (`GPU_MEM_UTIL=0.97`, `KV_MEM=8232441724` — since pushed to
+220,000/0.98/9126805504, see the KV cache section above; not yet re-run through a full
+BetterBench pass at the new ceiling), DFlash2-FP8 speculative decoding (n=7), fp8 KV cache on
+both target and drafter (real calibrated scales, not the uncalibrated fallback), `MAX_NUM_SEQS=3`,
+300 W. Single-stream weighted-combined median decode: **80.9 t/s**. Median prefill:
+**2771.8 t/s @2K** / **2538.8 t/s @16K**.
+
+#### Single-stream decode per category (median)
+
+| category | decode t/s (median) |
+|---|---:|
+| code | 91.8 |
+| file_edit | 101.4 |
+| json | 94.5 |
+| prose | 49.1 |
+| reasoning | 71.1 |
+| summarization | 75.1 |
+| **weighted combined** | **80.9** |
+
+#### Decode per concurrency level
+
+`MAX_NUM_SEQS=3` is the admission cap. Measured with BetterBench's concurrency sweep, same
+production config, 300 W:
+
+| concurrent streams | ok/req | aggregate t/s | TTFT p50 | TTFT p99 | per-stream decode t/s (median) |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 48/48 | 66.6 | ~106 ms | ~138 ms | 82.9 |
+| 2 | 48/48 | 121.5 | ~163 ms | ~226 ms | 80.3 |
+| 3 | 48/48 | 161.3 | ~170 ms | ~221 ms | 71.4 |
+
+Aggregate throughput scales **~2.4x** going from 1 to 3 concurrent streams, for a real ~14%
+per-stream decode cost at the full admission cap — near-linear, not a cliff. At the full
+`MAX_NUM_SEQS=3` admission cap, the card sustains **161.3 t/s** combined decode across all three
+concurrent streams. TTFT p50 grows through concurrency 2 then roughly holds at 3; the p99 tail
+stays in the same band through 2 and 3, no cliff there either.
+
 
 ## Quickstart: from scratch
 
@@ -81,10 +129,11 @@ EOF
 cd - >/dev/null
 
 # 5. DFlash2 drafter
-hf download syvai/Qwen3.8-27B-DFlash2-W4A16 --local-dir "$MODELS/Qwen3.8-27B-DFlash2-W4A16"
+hf download tcclaviger/Qwen3.8-27B-DFlash2-FP8 --local-dir "$MODELS/Qwen3.8-27B-DFlash2-FP8"
 
 # 6. Ornith-1.5-35B-A3B
-hf download MIRALABS/Ornith-1.5-35B-A3B-W4A16-SYM --local-dir "$MODELS/ornith-1.5-35b-a3b-w4a16-sym"
+hf download SergiioB/Ornith-1.5-35B-A3B-AutoRound-W4A16-sym-G128-MTP-BF16 \
+  --local-dir "$MODELS/Ornith-1.5-35B-A3B-AutoRound-W4A16-sym-G128-MTP-BF16"
 
 # 7. run either model
 chmod +x startup-qwen3.8-27b-vllm.sh startup-ornith-1.5-35b-vllm.sh
@@ -119,6 +168,11 @@ delta actually used (see the Dockerfile referenced in "Building the image" below
 | `mxfp4-configs/` | aiter GEMM tile configs, pinned to `matrix_instr_nonkdim=16` (aiter ships gfx950/gfx1250 tables only; gfx1250's bands ask for 32, which gfx1201's WMMA 16×16×16 can't lower) |
 | `radiance_mxfp4_fp8.hip` | the fp8-WMMA W4A8 GEMM kernel, compiled at build time with `hipcc --offload-arch=gfx1201` |
 
+`RADIANCE_SKINNY_GEMM` is set to `all` (not the narrower `1`) in the launcher, matching
+[`zzpanic/qwen3.6-vllm-gfx1201-launchers`](https://github.com/zzpanic/qwen3.6-vllm-gfx1201-launchers)'s
+own default — both settings measure the same on this backend within noise, so this is a
+consistency choice, not a performance one.
+
 ### 2. `fp8_mtp.py` (also from ggz14's repo — checkpoint prep, not a runtime patch)
 
 AMD's published `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` ships its MTP head in bf16 but doesn't
@@ -129,15 +183,97 @@ RTN and AWQ calibration measurably hurt drafter acceptance — RTN cost acceptan
 AWQ calibration didn't rescue it either). CPU-only, no GPU needed. Produces the checkpoint the
 Qwen launcher script actually serves.
 
-### 3. `patches/patch_dflash_w4a16_kv.py` — original work
+## Speculative drafter
 
-The one file in this directory that is genuinely original, not fetched from anywhere. Full
-explanation in `patches/README.md`. Short version: ggz14's `patch_dflash_mxfp4_kv.py` handles a
-drafter whose `qkv_proj.weight` exists but is packed MXFP4 uint8. The drafter this repo actually
-serves, `syvai/Qwen3.8-27B-DFlash2-W4A16`, is a **different quant family** (GPTQ-style
-compressed-tensors) that has **no `weight` attribute at all** — only `qweight`/`qzeros`/`scales`
-— so reading `.weight.dtype` raises `AttributeError` before ggz14's own fix can even run. Without
-this patch the drafter cannot be loaded, period.
+The launcher ships `tcclaviger/Qwen3.8-27B-DFlash2-FP8` as the DFlash2 drafter, with its KV cache
+also in `fp8` to match. It measures a real, healthy, non-zero acceptance rate in production
+(roughly 20-80% depending on prompt category).
+
+**Why this matters more than the drafter choice itself**: DFlash2 drafters hook a fixed set of
+the *target's* internal hidden-state layers (this drafter's own
+`target_layer_ids: [5, 19, 33, 47, 61]`), calibrated against one exact target checkpoint's
+activation distribution. **"Same base model" is not automatically "same drafter
+compatibility"** — a drafter qualified against one checkpoint is not presumptively safe against
+even a lightly-modified derivative of it, because the hook layers see a shifted activation
+distribution the drafter was never calibrated for. The origin release name is not a
+compatibility contract; the target checkpoint's own exact modification history is what actually
+matters.
+
+
+## KV cache: scale calibration and sizing
+
+Two separate, unrelated axes live under "KV cache" — this launcher addresses both.
+
+### Scale calibration (accuracy — what's actually stored)
+
+`--kv-cache-dtype fp8` alone is not enough for a correct fp8 KV cache. fp8 needs a real
+**k_scale/v_scale** per attention layer to map the target's native activation range into fp8's
+narrow dynamic range; without one, vLLM silently falls back to `scale=1.0` and logs `Using KV
+cache scaling factor 1.0 for fp8_e4m3. If this is unintended, verify that k/v_scale scaling
+factors are properly set in the checkpoint.` on every boot — easy to miss in a long startup log,
+and a real accuracy risk, not just a missed optimization. **This checkpoint carries real
+calibrated k_scale/v_scale**, and that warning is absent from its boot log — check your own boot
+log for its absence before trusting fp8 KV in production, especially if you swap checkpoints.
+
+Producing real scales needs a calibration pass against real activation data — either
+[llm-compressor](https://github.com/vllm-project/llm-compressor)'s `QuantizationModifier(scheme=None,
+kv_cache_scheme=...)` recipe (works when the checkpoint has separate `k_proj`/`v_proj` modules)
+or [AMD Quark](https://github.com/amd/Quark)'s `quantize_quark.py --kv_cache_dtype fp8` (needed
+for a fused `qkv_proj`, and the only path that also supports calibrating against one checkpoint
+and grafting the resulting scales onto a different, already-quantized one — what we actually
+used here). Two real gotchas worth knowing if you do this yourself:
+
+- **Quark's own naming for the scale tensors is not what vLLM expects.** It exports
+  `self_attn.{k,v}_proj.output_scale`, not `k_scale`/`v_scale` — and a naive string-rename onto
+  that same prefix lands at the *wrong* parameter path entirely if the checkpoint has any
+  wrapper nesting (e.g. a `language_model.` prefix on a VL-wrapped checkpoint). The only safe
+  approach is deriving the real output path from the *target* checkpoint's own tensor tree (its
+  real `k_proj`/`v_proj` weight names), never from a transform of Quark's own naming. A green
+  "tensors present" check passed here with the wrong path once — only a real boot with a
+  completion request, checking that the `scale=1.0` warning is actually gone, caught it.
+- **Not every layer necessarily gets a scale.** One attention layer's k_scale/v_scale can end up
+  missing from a calibration pass for reasons not fully root-caused yet — check your own boot log
+  for the warning line even after "successful" calibration; its presence for even one layer means
+  that layer is still running uncalibrated.
+
+### Sizing the KV pool once scales are right (capacity — how much fits)
+
+Separately from accuracy: vLLM's own `--gpu-memory-utilization`-driven profiling under-reports
+how much KV cache actually fits, because it sizes against a *profiling run's* transient
+activation peak — a peak steady-state serving never actually needs at the same time as a full
+cache. The only honest way to find the real ceiling is to push an explicit `--kv-cache-memory`
+pin until boot stops surviving, and back off for margin.
+
+**`kv-memory-calibrate.sh`** (in this repo's root, a light port for single gpu of Brian's
+[**ggz14**](https://codeberg.org/ggz14) calibrate-kv.sh) does exactly that — a boot-and-push search
+against `startup-qwen3.8-27b-vllm.sh` at your shape (`MAXSEQS`/`CHUNK`/`MAXLEN`), verified by a
+real prefill+decode probe at each step, not just a health check (the cache is allocated *before*
+cudagraph capture, so an over-committed pin can pass `/health` and still die at capture).
+
+```bash
+./kv-memory-calibrate.sh                # ~15-20 min, needs the GPU to itself
+# result: KV_MEM=<bytes> printed and saved to ~/.cache/radiance-mxfp4/kv-profiles.local.tsv
+KV_MEM=<bytes> ./startup-qwen3.8-27b-vllm.sh
+```
+
+At `MAX_NUM_SEQS=3`, `--max-model-len 220000`, `--gpu-memory-utilization 0.98`, this measures
+`GPU KV cache size: 226,790 tokens` — a 1.03x margin, reproduced identically across 3 separate
+clean boots (not just a lucky single run). That pin (already the default in
+`startup-qwen3.8-27b-vllm.sh`'s `KV_MEM`) is specific to this exact
+`MAXSEQS`/`CHUNK`/`MAXLEN`/`GPU_MEM_UTIL` shape — re-run the calibration yourself if you change
+any of those, or the checkpoint.
+
+**Note on using `kv-memory-calibrate.sh` itself at this shape**: its pass-1 gate (serving once
+with `KV_MEM` unset, to get a baseline before searching upward) FAILS outright at
+`MAX_MODEL_LEN=220000`/`GPU_MEM_UTIL=0.98` — the unpinned auto-profile only frees ~6.99 GiB,
+enough for an estimated ~179,712 tokens, well under both this pin and the checkpoint's own
+prior 190,000-token config. The 226,790-token result above was found by hand instead, pushing
+the `KV_MEM` pin directly against `startup-qwen3.8-27b-vllm.sh` the same way the script's own
+pass-2 search would, just without requiring pass-1 to succeed first. This is expected, not a
+bug in the script: a manually forced pin can always exceed what an unpinned auto-profile
+computes, because the profile run's own transient activation peak is never actually needed at
+the same instant as a full KV cache during real serving (see the script's own header).
+
 
 ## Model downloads & checkpoint prep
 
@@ -155,17 +291,21 @@ python3 /tmp/fp8_mtp.py $MODELS/Qwen3.8-27B-Quark-AWQ-MXFP4 $MODELS/Qwen3.8-27B-
 # then generate a per-token variant if desired (config-only, ~64KB of symlinks + a rewritten
 # config.json moving the MTP layers' input quantization from per-tensor to per-channel).
 
-# --- DFlash2 drafter (needs patch_dflash_w4a16_kv.py above to load) ---
-hf download syvai/Qwen3.8-27B-DFlash2-W4A16 --local-dir $MODELS/Qwen3.8-27B-DFlash2-W4A16
+# --- DFlash2 drafter ---
+hf download tcclaviger/Qwen3.8-27B-DFlash2-FP8 --local-dir $MODELS/Qwen3.8-27B-DFlash2-FP8
 
 # --- Ornith-1.5-35B-A3B ---
-hf download MIRALABS/Ornith-1.5-35B-A3B-W4A16-SYM --local-dir $MODELS/ornith-1.5-35b-a3b-w4a16-sym
-# NOTE: the release's own config.json quantization_config.ignore list omits the MTP head, which
-# is plain bf16 -- vLLM instantiates it quantized and fails to load without a fix. Append
-# "mtp.fc" and the regex "re:mtp\\." to that ignore list before serving (not needed for the
-# no-MTP config the launcher below runs, but required if MTP is ever re-enabled). Verify every
-# downloaded shard's size against the HF API's authoritative blob size, too -- a truncated
-# mid-transfer download can look complete in a casual `ls`.
+hf download SergiioB/Ornith-1.5-35B-A3B-AutoRound-W4A16-sym-G128-MTP-BF16 \
+  --local-dir $MODELS/Ornith-1.5-35B-A3B-AutoRound-W4A16-sym-G128-MTP-BF16
+# NOTE: this checkpoint's own bundled MTP head is community-reported as near-random-init quality
+# (~13-22% acceptance) -- the launcher script doesn't use it at all (see its own header for the
+# bake-off numbers against two independently-retrained replacement heads). No config.json fixes
+# needed for the no-MTP path this launcher runs. Verify every downloaded shard's size against the
+# HF API's authoritative blob size -- a truncated mid-transfer download can look complete in a
+# casual `ls`.
+# Also generate a tuned MoE kernel config before serving -- see the launcher script's own header
+# for the exact benchmark_moe.py command; this checkpoint's MoE shape ships with no tuned config
+# bundled in vLLM, and both decode and prefill measurably suffer without one.
 ```
 
 ## Building the image
@@ -201,19 +341,43 @@ script builds the image; run the `docker build` above first.
 | `MODELS_DIR` | `/models` | host dir mounted at `/models` — must contain the WHOLE tree, not just one model's subdir (see the Qwen script's MOUNT REQUIREMENT comment) |
 | `CACHE_DIR` | `./vllm-cache-mxfp4` | Triton/inductor/aiter compile cache — persist this or every boot re-autotunes |
 | `PORT` | `9300` | host port, also passed to `--port` |
-| `MAX_MODEL_LEN` | `163840` (Qwen) / `262144` (Ornith) | KV allocation ceiling — see the boot-log checklist below before raising |
-| `GPU_MEM_UTIL` | `0.95` | vLLM's `--gpu-memory-utilization` |
+| `MAX_MODEL_LEN` | `220000` (Qwen) / `262144` (Ornith) | KV allocation ceiling — see the boot-log checklist below before raising |
+| `GPU_MEM_UTIL` | `0.98` (Qwen) / `0.97` (Ornith) | vLLM's `--gpu-memory-utilization` |
+| `MAX_NUM_SEQS` | `3` (Qwen) / `4` (Ornith) | concurrent-sequence cap — see the concurrency section below for what this actually buys you at full context |
 | `NUM_SPEC_TOKENS` | `7` (Qwen only) | DFlash2 draft depth — the drafter was trained at this exact value |
 | `REASONING_EFFORT` | `medium` (Qwen only) | Qwen3.8's graded thinking-effort default |
+| `KV_MEM` | `9126805504` (Qwen only, ~8.5 GiB) | explicit `--kv-cache-memory` pin, measured by hand for `MAXSEQS=3`/`CHUNK=2560`/`MAXLEN=220000`/`GPU_MEM_UTIL=0.98` — see the KV cache section above; re-measure if you change any of those |
+| `TUNED_CONFIG_DIR` | `./moe-tuned-configs` (Ornith only) | where a tuned MoE kernel config (see script header) is picked up from, if present |
 | `POWER_CAP_W` | unset | optional GPU power cap in microwatts (e.g. `240000000` = 240 W) |
+
+### Concurrency (Ornith)
+
+`MAX_NUM_SEQS=4` is the admission cap, but real *parallel* concurrency depends on how much
+context each request actually uses relative to the KV pool (measured ~320K tokens at full
+262,144 context / 0.97 utilization):
+
+- Short/moderate prompts: genuinely 4 concurrent requests, no penalty — measured 4× ~20K-token
+  prompts all completing together in the same ~16.6s.
+- As combined context approaches the pool size, the scheduler gracefully **queues/staggers**
+  rather than erroring — measured 4× ~85K-token prompts (340K combined, over budget) all
+  succeeding but spread 75-101s instead of finishing together.
+- Two genuinely near-max-context requests (240K tokens each) will serialize almost completely
+  (measured 124.5s / 249s — the second visibly waits for the first) — you get correctness, not
+  concurrency, at that extreme. `floor(pool / MAX_MODEL_LEN)` is the real number of truly
+  parallel full-length requests this card supports, and at full 262,144 context that's 1.
 
 ## Boot-log checklist
 
 - `Using RadianceMxfp4W4A8LinearKernel` and `304/304 on our kernel, 0 FORCED ONTO AITER` —
   confirms the native MXFP4 kernel is actually engaged, not silently emulated (Qwen only).
 - `GPU KV cache size: N tokens` — the real, measured ceiling for this boot; it swings between
-  boots (Qwen measured 7.16–8.12 GiB free KV across identical boots at 163840) — if a boot fails
-  where the last one succeeded at the same `MAX_MODEL_LEN`, this is why; lower it.
+  boots (Qwen measured 7.16–8.12 GiB free KV across identical boots, historically at the old
+  163,840-token config — the same real boot-to-boot variance applies at other lengths, expect
+  it in general, though the current 220,000-token/9126805504-byte pin reproduced identically
+  across 3 separate clean boots when it was measured) — if a boot fails where the last one
+  succeeded at the same `MAX_MODEL_LEN`, this is why; lower it or back off the `KV_MEM` pin one
+  step (e.g. back to the prior 190,000/8232441724 config, itself already verified at real
+  production concurrency).
 - `creating MTP draft context against the target model` (only relevant if you ever re-enable
   Ornith's MTP) confirms the checkpoint's MTP tensors were actually found and loaded.
 - **Cold cache first boot**: an empty `CACHE_DIR` at `MAX_MODEL_LEN` above ~131072 can fail with
@@ -224,9 +388,11 @@ script builds the image; run the `docker build` above first.
 
 | symptom | cause | fix |
 |---|---|---|
-| `AttributeError: 'QKVParallelLinear' object has no attribute 'weight'` | `patch_dflash_w4a16_kv.py` not applied — building from an image that skipped it | rebuild, confirm the patch's `OK` line in the build log |
+| `AttributeError: 'QKVParallelLinear' object has no attribute 'weight'` | you swapped in a GPTQ-style/compressed-tensors drafter with no dense `.weight` tensor (only `qweight`/`qzeros`/`scales`) | this repo doesn't ship a patch for this — the FP8 drafter it serves carries a real dense `.weight` tensor and doesn't hit it; pick a drafter checkpoint that carries a real `.weight` tensor (fp8/dense formats do), or write an equivalent fix yourself |
 | `failed to tokenize reasoning strings: reasoning_start_str='', reasoning_end_str=''` (Qwen) | only the per-token model dir mounted, not the whole `models/` tree — its files are symlinks into a sibling dir | mount the entire `MODELS_DIR`, not a per-model subdirectory |
-| `AssertionError: In Mamba cache align mode, block_size (2096) must be <= max_num_batched_tokens` (Ornith) | `--max-num-batched-tokens` below 2096 | keep it at `2560` as shipped in the script — do not lower it |
+| `AssertionError: In Mamba cache align mode, block_size (N) must be <= max_num_batched_tokens` (Ornith) | `--max-num-batched-tokens` set below this checkpoint's own Mamba alignment block size (measured 1088 tokens for this specific checkpoint at this max-model-len — varies by checkpoint/context) | keep `--max-num-batched-tokens` at `8192` as shipped in the script, or check your own boot log's `Setting attention block size to N tokens` line before lowering it |
+| `WARNING max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings` silently truncating prefill even with a higher `--max-num-batched-tokens` set | only fires when `--speculative-config` is active — vLLM caps prefill chunks to 2048 regardless of the flag in that case | this launcher runs no speculative decoding by design, so it doesn't apply; if you re-enable MTP, expect this cap unless it's addressed separately |
+| decode much slower than the numbers in this README despite an otherwise-identical config | `VLLM_TUNED_CONFIG_FOLDER`/`TUNED_CONFIG_DIR` not populated — check the boot log for `Using default MoE config. Performance might be sub-optimal!` | run the `benchmark_moe.py` tuning step in the script's header once for your GPU |
 | `content: null` with a fully-populated `reasoning` field | a known upstream vLLM bug class in token-ID-based `</think>` boundary detection ([vllm-project/vllm#15758](https://github.com/vllm-project/vllm/issues/15758)) — architecture-agnostic, not fixable by patching this model | drop `--reasoning-parser` entirely; content lands raw with inline `<think>` tags instead |
 | MXFP4 running much slower than expected, no `RadianceMxfp4W4A8LinearKernel` in the log | `RADIANCE_MXFP4`/`RADIANCE_MXFP4_W4A8` not set, or `patch_quark_mxfp4.py` missing from the image | confirm both env vars are `1` and rebuild if the log never shows the kernel line |
 | container exits immediately, log mentions `/opt/templates/froggeric-qwen.jinja` not found | build step 5 (fetching the chat template) was skipped | add it to the Dockerfile, or drop `--chat-template ...` from the script's `VLLM_ARGS` to use the checkpoint's own template instead |
