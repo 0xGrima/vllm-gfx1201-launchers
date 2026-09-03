@@ -89,6 +89,18 @@ RUN_ARGS=(
   -e RADIANCE_MXFP4_SANITIZE=0                    # skips extra NaN/inf checks on the quantized path once verified stable
   -e RADIANCE_RMS_QUANT_FUSION=0                   # breaks the KV boot margin if set to 1
   -e RADIANCE_MXFP4_HOIST_QUANT=0                  # same — breaks the KV boot margin together with the above
+  # ADDED 2026-09-03, upstream sync to a5d68ba: real 300W BetterBench A/B on the internal
+  # production fleet (same target checkpoint, same drafter) measured WPERM+DECODE_NT as a genuine
+  # win — +2.7% weighted decode, +3.9% prefill@16K, +1.6% concurrency@1 vs. the a5d68ba baseline,
+  # every metric moved the same direction, no crash across 48 concurrent requests. GDN_NORM_QUANT
+  # + STRIDED_GATES measured NEUTRAL on the same run (kept on anyway, upstream's own verdict
+  # matched, no downside found). GDN_EMPTY_OUT is deliberately NOT set here — see this repo's own
+  # Dockerfile comment: it needs a rebuilt libr4d (rx5) to safely zero cudagraph pad rows, which
+  # this image's build does not do.
+  -e RADIANCE_MXFP4_WPERM=1                        # fragment-order weight layout, WMMA-aligned reads instead of strided (measured win)
+  -e RADIANCE_MXFP4_DECODE_NT=1                     # streaming (non-temporal) weight loads in the decode kernel (measured win)
+  -e RADIANCE_GDN_NORM_QUANT=1                      # fused gated-norm + fp8 quant, one HIP kernel replacing RMSNormGated + traced quant on each GDN layer (neutral, kept on)
+  -e RADIANCE_GDN_STRIDED_GATES=1                   # skip redundant .contiguous() copies on GDN gate tensors (neutral, kept on)
   -e VLLM_CACHE_ROOT=/cache/vllm                  # vLLM's own compile/config cache, mapped to the persistent CACHE_DIR
   -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor       # torch.compile cache, mapped to the persistent CACHE_DIR
   -e TRITON_CACHE_DIR=/cache/triton               # Triton JIT cache, mapped to the persistent CACHE_DIR

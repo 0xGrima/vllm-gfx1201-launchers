@@ -15,7 +15,12 @@
 
 # Digest-pinned, not just tag-pinned 
 ARG RADIANCE_IMAGE=stilldeadcode/vllm-radiance:0.9.3@sha256:45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
-ARG RUNTIME_DELTA_REF=7d261f8
+# BUMPED 7d261f8 -> a5d68ba, 2026-09-03 (24 commits, PR #24-#29). Brings in radiance_gdnmerge.py,
+# radiance_arnq.py (new file, backs the RADIANCE_GDN_NORM_QUANT fused gated-norm+fp8-quant
+# kernel) and patch_gdn_glue.py (new file). RADIANCE_MXFP4_WPERM/DECODE_NT are pre-existing
+# radiance_mxfp4.py/radiance_mxfp4_fp8.hip flags, not new to this bump, but only just measured
+# here for the first time (see startup-qwen3.8-27b-vllm.sh's own comment for the numbers).
+ARG RUNTIME_DELTA_REF=a5d68ba
 ARG GFX_ARCH=gfx1201
 
 # --- Stage 1: fetch ggz14's runtime delta + the third-party chat template, one stage, one
@@ -50,6 +55,7 @@ COPY --from=fetch /templates/froggeric-qwen.jinja /opt/templates/froggeric-qwen.
 RUN mkdir -p /opt/patches-mxfp4
 COPY --from=fetch \
     /delta/radiance_mxfp4.py /delta/radiance_gdn.py /delta/radiance_rmsquant.py \
+    /delta/radiance_gdnmerge.py /delta/radiance_arnq.py \
     ${SP}/
 COPY --from=fetch /delta/mxfp4-configs/ ${SP}/aiter/ops/triton/configs/gemm/
 COPY --from=fetch \
@@ -61,23 +67,33 @@ COPY --from=fetch \
     /delta/patch_rmsquant_fusion.py \
     /delta/patch_qwen3_thinkoff.py \
     /delta/patch_kv_group_size.py \
+    /delta/patch_gdn_glue.py \
     /delta/radiance_mxfp4_fp8.hip \
     /delta/_patchlib.py \
     /opt/patches-mxfp4/
 
-# Step 3: apply every patch, in order.
-# Step 4: compile the fp8-WMMA W4A8 GEMM kernel with hipcc.
+# Step 3: apply every patch, in order. patch_gdn_glue targets the stock vLLM "radiance hook" text
+# (qwen_gdn_linear_attn.py) this base image already carries pre-applied — see ../swap-mxfp4/
+# Dockerfile's own comment on this for why no patch_r4d.py run is needed first. Its two edits are
+# gated by RADIANCE_GDN_STRIDED_GATES (safe here, doesn't need a rebuilt libr4d) /
+# RADIANCE_GDN_EMPTY_OUT (NOT enabled by either startup script below -- unlike the internal
+# production build, THIS image has no libr4d-rebuild stage, so there is no rx5 kernel to zero the
+# cudagraph pad rows EMPTY_OUT relies on; enabling it here without that rebuild would leak
+# uninitialized GPU memory into the padded rows -- a real correctness bug, not just a perf no-op).
+# Step 4: compile the fp8-WMMA W4A8 GEMM kernel with hipcc (also now carries the new
+# radiance::gdn_norm_quant kernel radiance_arnq.py's RADIANCE_GDN_NORM_QUANT binds to, and the
+# A-tiled prefill GEMM path -- both inert unless their own env var is set).
 RUN cd /opt/patches-mxfp4 \
  && for p in patch_quark_mxfp4 patch_dflash_mxfp4_kv \
              patch_topk_triton_rows patch_ar_maxbytes patch_dflash_calib patch_rmsquant_fusion \
-             patch_kv_group_size; do \
+             patch_kv_group_size patch_gdn_glue; do \
       echo "== applying $p =="; python "$p.py"; \
     done \
  && (python patch_qwen3_thinkoff.py || echo "WARNING: thinkoff did not apply (non-fatal)") \
  && INC=$(python -m pybind11 --includes) \
  && hipcc -O3 -std=c++17 -fPIC -shared --offload-arch=${GFX_ARCH} -Wno-unused-result \
       $INC radiance_mxfp4_fp8.hip -o ${SP}/radiance_mxfp4_fp8.so \
- && python -c "import torch, radiance_mxfp4_fp8 as m, radiance_mxfp4, radiance_rmsquant; \
+ && python -c "import torch, radiance_mxfp4_fp8 as m, radiance_mxfp4, radiance_rmsquant, radiance_arnq; \
 assert hasattr(m, 'launch'); print('mxfp4 w4a8 kernel built + all runtime modules importable')" \
  && python -c "import ast, glob; [ast.parse(open(f).read()) for f in glob.glob('${SP}/radiance_*.py')]; \
 print('radiance modules parse OK')"
