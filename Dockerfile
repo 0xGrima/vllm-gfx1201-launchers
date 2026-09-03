@@ -3,7 +3,7 @@
 #
 # Two things are fetched at build time rather than vendored in this repo, same policy for both:
 # they're third-party/upstream content, not this repo's own work.
-#   1. codeberg.org/ggz14/radiance-vllm-mxfp4 @ dba9def   (the MXFP4 runtime delta)
+#   1. codeberg.org/ggz14/radiance-vllm-mxfp4 @ 7d261f8   (the MXFP4 runtime delta)
 #   2. huggingface.co/froggeric/Qwen-Fixed-Chat-Templates (the chat template both launchers need)
 #
 # Build:
@@ -15,7 +15,7 @@
 
 # Digest-pinned, not just tag-pinned 
 ARG RADIANCE_IMAGE=stilldeadcode/vllm-radiance:0.9.3@sha256:45694209177a55a1ab3ba6702fe6e978b1b66a6e66ae3fc066f8d579f7bc4c25
-ARG RUNTIME_DELTA_REF=dba9def
+ARG RUNTIME_DELTA_REF=7d261f8
 ARG GFX_ARCH=gfx1201
 
 # --- Stage 1: fetch ggz14's runtime delta + the third-party chat template, one stage, one
@@ -60,14 +60,10 @@ COPY --from=fetch \
     /delta/patch_dflash_calib.py \
     /delta/patch_rmsquant_fusion.py \
     /delta/patch_qwen3_thinkoff.py \
+    /delta/patch_kv_group_size.py \
     /delta/radiance_mxfp4_fp8.hip \
     /delta/_patchlib.py \
     /opt/patches-mxfp4/
-
-# This repo's own patch, not part of ggz14's delta -- fixes vLLM's hybrid-model KV cache group
-# sizing (upstream picks the smallest bucket, wrong for this layer mix; see the patch's own
-# docstring for the measured +20.7% usable KV tokens). Unconditional, order-agnostic.
-COPY patches/patch_kv_group_size.py /opt/patches-mxfp4/
 
 # Step 3: apply every patch, in order.
 # Step 4: compile the fp8-WMMA W4A8 GEMM kernel with hipcc.
