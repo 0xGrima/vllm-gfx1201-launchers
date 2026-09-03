@@ -11,7 +11,7 @@ plain AutoRound-produced GPTQ W4A16, full native context, vision enabled.
 Both models run on the same image — one 32 GB card fits one resident model at a time. Base is the
 published [`stilldeadcode/vllm-radiance:0.9.3`](https://hub.docker.com/r/stilldeadcode/vllm-radiance)
 (vLLM 0.27.1, DFlash2 and `libr4d` 0.5.0 already in-tree), with a runtime patch delta from
-[`ggz14/radiance-vllm-mxfp4`](https://codeberg.org/ggz14/radiance-vllm-mxfp4) @ `dba9def` applied
+[`ggz14/radiance-vllm-mxfp4`](https://codeberg.org/ggz14/radiance-vllm-mxfp4) @ `7d261f8` applied
 on top for the native MXFP4 (W4A8) kernel path.
 
 | model | quant | speculative decoding | context | decode (weighted combined) | prefill@16K |
@@ -164,6 +164,7 @@ delta actually used (see the Dockerfile referenced in "Building the image" below
 | `patch_dflash_calib.py` | activation-statistics hooks for drafter quantization; dark unless `RADIANCE_DFLASH_CALIB` set |
 | `patch_rmsquant_fusion.py` | rms+quant fusion op; dark unless `RADIANCE_RMS_QUANT_FUSION=1` — measured within-noise at lower context, and breaks the KV boot margin at 163840 ctx |
 | `patch_qwen3_thinkoff.py` | non-fatal fix for `content=null` on thinking-off requests |
+| `patch_kv_group_size.py` | picks the hybrid-model KV cache group size by usable capacity instead of upstream's `min(bucket)` heuristic — upstream's choice doesn't divide this checkpoint's layer-type bucket sizes evenly, wasting padding *and* forcing every request to round up per-group; measured +20.7% usable KV tokens on this checkpoint's layer mix. Unconditional, order-agnostic with the rest — see the patch's own docstring for the full derivation |
 | `radiance_mxfp4.py` / `radiance_gdn.py` / `radiance_rmsquant.py` | the runtime modules the patches above wire into |
 | `mxfp4-configs/` | aiter GEMM tile configs, pinned to `matrix_instr_nonkdim=16` (aiter ships gfx950/gfx1250 tables only; gfx1250's bands ask for 32, which gfx1201's WMMA 16×16×16 can't lower) |
 | `radiance_mxfp4_fp8.hip` | the fp8-WMMA W4A8 GEMM kernel, compiled at build time with `hipcc --offload-arch=gfx1201` |
@@ -262,6 +263,13 @@ clean boots (not just a lucky single run). That pin (already the default in
 `startup-qwen3.8-27b-vllm.sh`'s `KV_MEM`) is specific to this exact
 `MAXSEQS`/`CHUNK`/`MAXLEN`/`GPU_MEM_UTIL` shape — re-run the calibration yourself if you change
 any of those, or the checkpoint.
+
+That figure already assumes `patch_kv_group_size.py` (see the patch table above) is in the image —
+its own boot log line reads `[radiance] kv cache groups: size 8, 9 groups, 324 blocks/request
+(upstream would pick size 5)`. Without the patch there's no such line and vLLM silently falls back
+to its own `min(bucket)` choice (`size 5` on this checkpoint's layer mix) — the same `KV_MEM` pin
+then fits meaningfully fewer usable tokens, since more groups means more independent per-request
+block round-ups eating into the same memory budget.
 
 **Note on using `kv-memory-calibrate.sh` itself at this shape**: its pass-1 gate (serving once
 with `KV_MEM` unset, to get a baseline before searching upward) FAILS outright at
