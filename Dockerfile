@@ -64,11 +64,17 @@ COPY --from=fetch \
     /delta/_patchlib.py \
     /opt/patches-mxfp4/
 
+# This repo's own patch, not part of ggz14's delta -- fixes vLLM's hybrid-model KV cache group
+# sizing (upstream picks the smallest bucket, wrong for this layer mix; see the patch's own
+# docstring for the measured +20.7% usable KV tokens). Unconditional, order-agnostic.
+COPY patches/patch_kv_group_size.py /opt/patches-mxfp4/
+
 # Step 3: apply every patch, in order.
 # Step 4: compile the fp8-WMMA W4A8 GEMM kernel with hipcc.
 RUN cd /opt/patches-mxfp4 \
  && for p in patch_quark_mxfp4 patch_dflash_mxfp4_kv \
-             patch_topk_triton_rows patch_ar_maxbytes patch_dflash_calib patch_rmsquant_fusion; do \
+             patch_topk_triton_rows patch_ar_maxbytes patch_dflash_calib patch_rmsquant_fusion \
+             patch_kv_group_size; do \
       echo "== applying $p =="; python "$p.py"; \
     done \
  && (python patch_qwen3_thinkoff.py || echo "WARNING: thinkoff did not apply (non-fatal)") \

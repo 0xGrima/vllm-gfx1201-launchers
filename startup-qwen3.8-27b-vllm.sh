@@ -121,7 +121,7 @@ RUN_ARGS=(
 # output, just slower than no speculation at all, so this failure is invisible without checking
 # that exact log line.
 VLLM_ARGS=(
-  serve /models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken   # the target checkpoint (see MOUNT REQUIREMENT above)
+  /models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken         # the target checkpoint (see MOUNT REQUIREMENT above)
   --served-model-name qwen3.8-27b-mxfp4 qwen-mxfp4 qwen3.8-mxfp4  # aliases for API clients/routers
   --kv-cache-dtype fp8                              # halves KV memory vs bf16; safe here because this
                                                      # checkpoint carries real calibrated k_scale/v_scale
