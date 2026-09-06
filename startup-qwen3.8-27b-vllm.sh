@@ -63,7 +63,10 @@ RUN_ARGS=(
   -e HSA_ENABLE_MWAITX=1                          # lets the ROCm runtime use MWAITX for wait-loops, cheaper than a spin
   -e VLLM_USE_V2_MODEL_RUNNER=1                   # required runner version for DFlash2 speculative decoding support
   -e VLLM_ROCM_USE_AITER=1                        # enables the aiter kernel library as the ROCm backend
-  -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1      # matches --attention-backend ROCM_AITER_UNIFIED_ATTN below
+  # CHANGED 1 -> 0, 2026-09-06: superseded by --attention-backend R4D below, see the adoption
+  # note further down for the measured numbers and why this differs from the 2026-08-27 R4D
+  # rejection (this repo's own AGENTS.md rule 10 / production's swap-mxfp4/README.md).
+  -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=0      # superseded by --attention-backend R4D below
   -e VLLM_ROCM_USE_AITER_MHA=0                    # unified attention above supersedes aiter's separate MHA path
   -e VLLM_ROCM_USE_AITER_MLA=0                    # this checkpoint isn't MLA, nothing to enable
   -e VLLM_ROCM_USE_AITER_MOE=0                    # not an MoE checkpoint, nothing to enable
@@ -101,6 +104,27 @@ RUN_ARGS=(
   -e RADIANCE_MXFP4_DECODE_NT=1                     # streaming (non-temporal) weight loads in the decode kernel (measured win)
   -e RADIANCE_GDN_NORM_QUANT=1                      # fused gated-norm + fp8 quant, one HIP kernel replacing RMSNormGated + traced quant on each GDN layer (neutral, kept on)
   -e RADIANCE_GDN_STRIDED_GATES=1                   # skip redundant .contiguous() copies on GDN gate tensors (neutral, kept on)
+  # ADOPTED 2026-09-06, following up on this repo's own comparison against
+  # zzpanic/qwen3.6-vllm-gfx1201-launchers the same day. Plain R4D (stock f16 attention legs) was
+  # tried and REJECTED on 2026-08-27: +4.4% prefill but ~2.5x KV cost/token, capping context to
+  # ~16K on a 32 GiB card. The fp8 legs are a DIFFERENT trade -- independently re-measured on the
+  # PRODUCTION fleet's qwen3.8-27b-mxfp4-uncensored-orcarouter entry (fp8 KV, same base image,
+  # same DFlash2 FP8 drafter, standalone containers, production stopped/restored around each run):
+  #   KV pool:      151,318 tok / 6.87 GiB (AITER)  ->  153,560 tok / 6.9 GiB (R4D+fp8 legs), +1.5%
+  #   Prefill @16k: 2,598 -> 2,770 t/s (+6.6%)   @32k: 2,364 -> 2,635 (+11.5%)   @64k: 1,967 -> 2,433 (+23.7%)
+  #   Decode:       82.3 -> 83.0 t/s (+0.8%, noise)
+  # Reproduces zzpanic's own claimed shape ("+1.7/5.6/24.9% at 4k/16k/64k") independently. The
+  # 2026-08-27 memory blocker was specific to the f16 attention legs, not R4D itself -- the fp8
+  # legs bring KV memory to near-parity with AITER while keeping the prefill win.
+  # NOT independently re-benchmarked on THIS checkpoint (Qwen3.8-27B-MXFP4-mtpfp8-pertoken) --
+  # carried over from the uncensored-orcarouter measurement on the strength of matching
+  # architecture/kernels/drafter/fp8-KV. Re-verify with BetterBench on this exact checkpoint
+  # before trusting the numbers above to transfer exactly.
+  # 3 = both O_QK8 and O_PV8 fp8 legs (see production's r4d_radiance_extras.patch); fp8 KV only,
+  # matches --kv-cache-dtype fp8 below. Also re-confirmed the same day that RADIANCE_FP8_STREAM
+  # correctly stays unset here: radiance_arnq.py's own install() unconditionally skips at TP=1
+  # (line 262, "tp=1, skipping"), a hard source-level guard, not a stale assumption.
+  -e R4D_ATTN_FP8=3                                 # 8-bit prefill attention legs for the R4D backend below
   -e VLLM_CACHE_ROOT=/cache/vllm                  # vLLM's own compile/config cache, mapped to the persistent CACHE_DIR
   -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor       # torch.compile cache, mapped to the persistent CACHE_DIR
   -e TRITON_CACHE_DIR=/cache/triton               # Triton JIT cache, mapped to the persistent CACHE_DIR
@@ -145,7 +169,9 @@ VLLM_ARGS=(
   --max-model-len "$MAX_MODEL_LEN"                  # see MAX_MODEL_LEN above
   --max-num-seqs "$MAX_NUM_SEQS"                    # see MAX_NUM_SEQS above
   --max-num-batched-tokens 2560                     # prefill chunk size the KV_MEM pin above was calibrated against
-  --attention-backend ROCM_AITER_UNIFIED_ATTN       # matches VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION above
+  --attention-backend R4D                           # CHANGED from ROCM_AITER_UNIFIED_ATTN, 2026-09-06 -- see
+                                                     # the R4D_ATTN_FP8 adoption note above for the measured
+                                                     # numbers and why this differs from the 2026-08-27 rejection
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16]}'  # covers up to batch=4 at MAX_NUM_SEQS=3,
                                                      # see MAX_NUM_SEQS above
   --enable-prefix-caching                           # reuses KV for repeated prompt prefixes; unlike Ornith
