@@ -89,7 +89,7 @@ RUN_ARGS=(
   -e VLLM_CACHE_ROOT=/cache/vllm                  # vLLM's own compile/config cache, mapped to the persistent CACHE_DIR
   -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor       # torch.compile cache, mapped to the persistent CACHE_DIR
   -e TRITON_CACHE_DIR=/cache/triton               # Triton JIT cache, mapped to the persistent CACHE_DIR
-  -e AITER_ROOT_DIR=/cache/aiter                  # aiter's kernel build cache, mapped to the persistent CACHE_DIR
+  -e AITER_JIT_DIR=/cache/aiter                  # aiter's kernel build cache, mapped to the persistent CACHE_DIR
   -e TRITON_CACHE_AUTOTUNING=1                    # persists autotuning results across restarts, not just compiled kernels
   -v "$MODELS_DIR:/models"
   -v "$CACHE_DIR:/cache"
