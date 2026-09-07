@@ -283,6 +283,55 @@ computes, because the profile run's own transient activation peak is never actua
 the same instant as a full KV cache during real serving (see the script's own header).
 
 
+### Comparing against production (`MAX_NUM_SEQS=2` override) — the pin does not carry over
+
+This launcher's own default is `MAX_NUM_SEQS=3` (see the script header) — a different shape from
+the `_infra` production fleet's `qwen3.8-27b-mxfp4-uncensored-orcarouter` entry, which runs
+`--max-num-seqs 2`. Production's choice is deliberate: DFlash2 needs at least 2 concurrent
+sequences for real decode throughput (a lone stream loses the second verify slot), and 2 is
+the floor that keeps both streams close to a genuine zero-recompute guarantee at long context —
+3 trades some per-stream margin for a third concurrent slot instead.
+
+**If you override `MAX_NUM_SEQS=2` here to compare against production, you must also re-measure
+`KV_MEM` — do not reuse this launcher's own `MAX_NUM_SEQS=3` pin.** `max-num-seqs` moves the
+attention block-size accounting (same lesson as `_infra`'s own `swap-mxfp4/config.yaml`: "never
+carry a block size across entries — read it off the boot"), so a pin calibrated at one
+`MAXSEQS`/`MAXLEN` shape is not valid at another — it either wastes real, safe margin or, worse,
+sits closer to the edge than it looks. Re-run `kv-memory-calibrate.sh` (or push a manual pin by
+hand, verified via a real boot) at the exact shape you intend to run, every time `MAXSEQS`,
+`CHUNK`, or `MAXLEN` changes.
+
+**Real finding from doing this comparison**: even after matching `KV_MEM` to production's exact
+pinned value — giving an *identical* GPU KV pool size (207,362 tokens on both sides) — decode and
+prefill throughput still differed from production by several percent. Traced to the checkpoint
+itself, not the config: this launcher serves `Qwen3.8-27B-MXFP4-mtpfp8-pertoken`, which lacks
+calibrated fp8 KV scales (its boot log shows `"Using KV cache scaling factor 1.0 for fp8_e4m3"` /
+`"uncalibrated q_scale 1.0"` — see the Scale calibration section above for what that warning
+means), while production serves a KV-scale-*calibrated* derivative. Same architecture, same
+R4D_ATTN_FP8 kernels, different weights:
+
+| | production (`kv-calib-output-uncensored`) | this launcher (matched KV pool) | Δ |
+|---|--:|--:|--:|
+| decode | 79.6 t/s | 83.8 t/s | +5.3% |
+| prefill @16k | 2,768.3 t/s | 2,696.0 t/s | -2.6% |
+| prefill @32k | 2,640.3 t/s | 2,518.8 t/s | -4.6% |
+| prefill @64k | 2,434.9 t/s | 2,240.7 t/s | -8.0% |
+
+Conclusion: a matched KV pool proves the *config* transfers correctly (R4D + fp8 attention legs
+work identically either way — confirmed in both boot logs), but it does not make the *numbers*
+comparable across different checkpoints. Don't read a throughput delta between this launcher and
+production as a config regression without first checking which checkpoint each side is actually
+serving.
+
+**Separately, also found this session and worth knowing if you use `--kv-offloading-size`**: the
+old blocker where `ROCM_AITER_UNIFIED_ATTN` flatly rejects vLLM's KV offloading connector
+(`'KV connector not supported'`) does **not** apply to `--attention-backend R4D` — R4D and the
+offloading connector compose cleanly, verified with real concurrent long-context requests, not
+just a clean boot. One real gotcha along the way: the offloading connector's CPU buffer is backed
+by a file in `/dev/shm`, and Docker's default shm size (64MB) is nowhere near enough — a
+too-small `--shm-size` fails with a cryptic `OSError: [Errno 14] Bad address` from `madvise`, not
+an obvious out-of-memory message. Size `--shm-size` comfortably above your `--kv-offloading-size`.
+
 ## Model downloads & checkpoint prep
 
 Steps to download the models and do an mtp conversion.
